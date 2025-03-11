@@ -1,0 +1,164 @@
+import { createPublicClient, http, Log } from 'viem';
+import { mainnet } from 'viem/chains';
+import pino from 'pino';
+import { config } from 'dotenv';
+import axios from 'axios';
+import fs from 'fs/promises';
+
+// Load environment variables from .env file
+config();
+
+const logger = pino({
+    transport: {
+        target: 'pino-pretty',
+        options: { colorize: true }
+    }
+});
+
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL!;
+const RPC_URL = process.env.RPC_URL!;
+const TRANSFER_CONTRACT_ADDRESS = process.env.TRANSFER_CONTRACT_ADDRESS!;
+
+interface TokenHolding {
+    wallet: string;
+    tokenAddress: string;
+    balance: string;
+    creator: string;
+}
+
+interface Event {
+    contract: string;
+    tokensTransferred: string;
+    amountEth: string;
+    signature: string;
+}
+
+// Send a Discord notification
+async function sendDiscordNotification(event: Event) {
+    const explorerLink = `https://basescan.org/address/${event.contract}`;
+
+    const embed = {
+        title: `🔄 Event Detected`,
+        description: `An event has been detected.`,
+        color: 0xFF0000,
+        timestamp: new Date().toISOString(),
+        fields: [
+            { name: 'Contract Address', value: event.contract, inline: true },
+            { name: 'Tokens Transferred', value: event.tokensTransferred, inline: true },
+            { name: 'Amount (ETH)', value: event.amountEth, inline: true },
+            { name: 'Signature', value: event.signature, inline: true },
+            { name: 'Contract Link', value: `[Link](${explorerLink})`, inline: true }
+        ]
+    };
+
+    const payload = {
+        embeds: [embed]
+    };
+
+    try {
+        const response = await axios.post(DISCORD_WEBHOOK_URL, payload, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        if (response.status !== 200 && response.status !== 204) {
+            throw new Error(`Error status: ${response.status}`);
+        }
+        logger.info(`Notification sent successfully for event: ${event.contract}`);
+    } catch (error) {
+        logger.error('Error sending Discord notification:', error);
+    }
+}
+
+// Load token holdings from JSON file
+async function loadTokenHoldings(filePath: string): Promise<TokenHolding[]> {
+    try {
+        const data = await fs.readFile(filePath, 'utf-8');
+        logger.info(`Loaded token holdings from ${filePath}`);
+        return JSON.parse(data) as TokenHolding[];
+    } catch (error) {
+        logger.error('Error loading token holdings:', error);
+        throw error;
+    }
+}
+
+// Start monitoring using watchContractEvent
+async function startMonitoring() {
+    const client = createPublicClient({
+        transport: http(RPC_URL),
+        chain: mainnet
+    });
+
+    const tokenHoldings = await loadTokenHoldings('token_holdings.json');
+
+    logger.info('Setting up watch for contract events...');
+
+    const unwatch = client.watchContractEvent({
+        address: TRANSFER_CONTRACT_ADDRESS as `0x${string}`,
+        abi: [
+            {
+                name: "sell",
+                type: "event",
+                inputs: [
+                    { type: "address", name: "contract" },
+                    { type: "uint256", name: "amountEth" },
+                    { type: "uint256", name: "tokensTransferred" },
+                    { type: "bytes32", name: "signature" }
+                ]
+            }
+        ],
+        onLogs: async (logs: Log[]) => {
+            logger.info(`Fetched ${logs.length} logs`);
+            if (logs.length === 0) {
+                logger.info('No logs found in this interval.');
+            }
+            for (const log of logs) {
+                try {
+                    logger.info(`Raw log: ${JSON.stringify(log, null, 2)}`);
+
+                    // Extracting log data manually
+                    const contractAddress = log.address;
+                    const topics = log.topics;
+                    const data = log.data;
+
+                    // Decode the log manually
+                    const tokensTransferred = BigInt(data.slice(0, 66)).toString(); // 32 bytes, 66 chars
+                    const amountEth = BigInt(data.slice(66, 130)).toString(); // Next 32 bytes, 66 chars
+                    const signature = data.slice(130, 194); // Remaining bytes
+
+                    const matchingHolding = tokenHoldings.find(holding => holding.tokenAddress.toLowerCase() === contractAddress.toLowerCase());
+
+                    if (matchingHolding) {
+                        const event: Event = {
+                            contract: contractAddress,
+                            tokensTransferred,
+                            amountEth,
+                            signature
+                        };
+
+                        logger.info(`Detected event: ${JSON.stringify(event)}`);
+
+                        await sendDiscordNotification(event);
+                    } else {
+                        logger.info(`No matching holding found for contract address: ${contractAddress}`);
+                    }
+                } catch (decodeError) {
+                    logger.error(`Error processing log: ${JSON.stringify(log)} - ${decodeError}`);
+                }
+            }
+        },
+        onError: (error) => {
+            logger.error('Error watching contract event:', error);
+        }
+    });
+
+    logger.info('Started watching contract events.');
+
+    // Optionally, unwatch after a certain period
+     setTimeout(() => {
+        unwatch();
+       logger.info('Stopped watching contract events.');
+     }, 60000); // Stop after 60 seconds for example
+}
+
+startMonitoring();

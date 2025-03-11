@@ -1,0 +1,198 @@
+import { createPublicClient, http, parseAbiItem, decodeEventLog } from 'viem';
+import { mainnet } from 'viem/chains';
+import pino from 'pino';
+import { config } from 'dotenv';
+import axios from 'axios';
+import fs from 'fs/promises';
+
+// Load environment variables from .env file
+config();
+
+const logger = pino({
+    transport: {
+        target: 'pino-pretty',
+        options: { colorize: true }
+    }
+});
+
+const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL!;
+const RPC_URL = process.env.RPC_URL!;
+const TRANSFER_CONTRACT_ADDRESS = process.env.TRANSFER_CONTRACT_ADDRESS!;
+
+interface TransferEvent {
+    tokenAddress: string;
+    amountEth: string;
+    tokensTransferred: string;
+    signature: string;
+}
+
+interface TokenHolding {
+    wallet: string;
+    tokenAddress: string;
+    balance: string;
+    creator: string;
+}
+
+// Send a Discord notification
+async function sendDiscordNotification(transferEvent: TransferEvent) {
+    const explorerLink = `https://basescan.org/address/${transferEvent.tokenAddress}`;
+
+    const embed = {
+        title: `🔄 Token Sale Detected`,
+        description: `Tokens have been sold or transferred.`,
+        color: 0xFF0000,
+        timestamp: new Date().toISOString(),
+        fields: [
+            { name: 'Token Address', value: transferEvent.tokenAddress, inline: true },
+            { name: 'Amount (Tokens)', value: transferEvent.tokensTransferred, inline: true },
+            { name: 'Amount (ETH)', value: transferEvent.amountEth, inline: true },
+            { name: 'Transaction Signature', value: transferEvent.signature, inline: true },
+            { name: 'Token Address', value: `[Link](${explorerLink})`, inline: true }
+        ]
+    };
+
+    const payload = {
+        embeds: [embed]
+    };
+
+    try {
+        const response = await axios.post(DISCORD_WEBHOOK_URL, payload, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+        if (response.status !== 200 && response.status !== 204) {
+            throw new Error(`Error status: ${response.status}`);
+        }
+        logger.info(`Notification sent successfully for token sale.`);
+    } catch (error) {
+        logger.error('Error sending Discord notification:', error);
+    }
+}
+
+// Load token holdings from JSON file
+async function loadTokenHoldings(filePath: string): Promise<TokenHolding[]> {
+    try {
+        const data = await fs.readFile(filePath, 'utf-8');
+        logger.info(`Loaded token holdings from ${filePath}`);
+        return JSON.parse(data) as TokenHolding[];
+    } catch (error) {
+        logger.error('Error loading token holdings:', error);
+        throw error;
+    }
+}
+
+// Fetch token decimals
+async function fetchTokenDecimals(client: ReturnType<typeof createPublicClient>, tokenAddress: string): Promise<number> {
+    try {
+        const decimals = await client.readContract({
+            address: tokenAddress as `0x${string}`,
+            abi: [{
+                constant: true,
+                inputs: [],
+                name: 'decimals',
+                outputs: [{ name: '', type: 'uint8' }],
+                type: 'function'
+            }],
+            functionName: 'decimals'
+        }) as number;
+
+        return decimals;
+    } catch (error) {
+        logger.error(`Error fetching decimals for token ${tokenAddress}: ${error}`);
+        return 18; // Default to 18 if not available
+    }
+}
+
+// Convert token amount to human-readable format
+function convertTokenAmount(amount: bigint, decimals: number): string {
+    return (Number(amount) / Math.pow(10, decimals)).toString();
+}
+
+// Monitor token transfers using polling
+async function monitorTokenTransfers(client: ReturnType<typeof createPublicClient>, tokenHoldings: TokenHolding[]) {
+    const abiItem = parseAbiItem('event Transfer(address indexed contract, uint256 amountEth, uint256 tokensTransferred, bytes32 signature)');
+
+    const pollInterval = 10000; // 10 seconds
+
+    const pollLogs = async () => {
+        logger.info('Polling for token transfers...');
+        try {
+            const currentBlock = await client.getBlockNumber();
+            const fromBlock = currentBlock - 1000n; // Adjust the block range as needed
+
+            logger.info(`Fetching logs with the following parameters:`);
+            logger.info(`Contract Address: ${TRANSFER_CONTRACT_ADDRESS}`);
+            logger.info(`From Block: ${fromBlock}`);
+            logger.info(`To Block: latest`);
+            logger.info(`ABI Item: ${JSON.stringify(abiItem)}`);
+
+            const logs = await client.getLogs({
+                address: TRANSFER_CONTRACT_ADDRESS as `0x${string}`,
+                fromBlock,
+                toBlock: 'latest',
+                event: abiItem
+            });
+
+            logger.info(`Fetched ${logs.length} logs`);
+            for (const log of logs) {
+                try {
+                    const decodedLog = decodeEventLog({
+                        abi: [abiItem],
+                        data: log.data,
+                        topics: log.topics
+                    });
+
+                    logger.info(`Log: ${JSON.stringify(log, null, 2)}`);
+                    logger.info(`Decoded Log: ${JSON.stringify(decodedLog, null, 2)}`);
+
+                    const tokenAddress = decodedLog.args.contract.toLowerCase();
+                    const amountEth = decodedLog.args.amountEth.toString(); // Convert BigInt to string
+                    const tokensTransferred = decodedLog.args.tokensTransferred; // BigInt
+                    const signature = decodedLog.args.signature;
+
+                    const decimals = await fetchTokenDecimals(client, tokenAddress);
+                    const humanReadableTokensTransferred = convertTokenAmount(tokensTransferred, decimals);
+
+                    const matchingHolding = tokenHoldings.find(holding => holding.tokenAddress.toLowerCase() === tokenAddress);
+
+                    if (matchingHolding) {
+                        const transferEvent: TransferEvent = {
+                            tokenAddress,
+                            amountEth,
+                            tokensTransferred: humanReadableTokensTransferred,
+                            signature
+                        };
+
+                        logger.info(`Detected transfer for token address: ${transferEvent.tokenAddress} amount: ${transferEvent.tokensTransferred} tokens`);
+
+                        await sendDiscordNotification(transferEvent);
+                    }
+                } catch (decodeError) {
+                    logger.error(`Error processing log: ${JSON.stringify(log)} - ${decodeError}`);
+                }
+            }
+        } catch (error) {
+            logger.error('Error fetching logs:', error);
+        }
+
+        setTimeout(pollLogs, pollInterval);
+    };
+
+    pollLogs();
+}
+
+// Start monitoring
+async function startMonitoring() {
+    const client = createPublicClient({
+        transport: http(RPC_URL),
+        chain: mainnet
+    });
+
+    const tokenHoldings = await loadTokenHoldings('token_holdings.json');
+
+    // Monitor token transfers
+    monitorTokenTransfers(client, tokenHoldings);
+}
+
+startMonitoring();
